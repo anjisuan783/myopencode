@@ -23,6 +23,8 @@ import {
   bootstrapSessionData,
   createSessionData,
   flushInterrupted,
+  hasMeaningfulOutput,
+  lastUserTurn,
   pickBlockerView,
   reduceSessionData,
   type SessionData,
@@ -121,6 +123,14 @@ type State = {
   blockerTick: number
   selectedSubagent?: string
   blockers: Map<string, number>
+  /** 当前 turn 最后一条 assistant 消息是否为"无 finish 无 error"（用户中断的纯 thinking 半截）。 */
+  interruptedTurn: boolean
+  /**
+   * 本 turn 发送的用户提示词文本。SessionData 在 includeUserText=false 时
+   * 会丢弃 user 文本部分，lastUserTurn 读不到文本，auto-restore 需要这里
+   * 保存的一份来恢复输入框。
+   */
+  lastUserText?: string
 }
 
 type TransportService = {
@@ -450,6 +460,7 @@ function createLayer(input: StreamInput) {
           footerView: { type: "prompt" },
           blockerTick: 0,
           blockers: new Map(),
+          interruptedTurn: false,
         }
         let booting = true
         let replaying = false
@@ -871,6 +882,94 @@ function createLayer(input: StreamInput) {
           }
         })
 
+        // 用户中断纯 thinking 的旧任务（半截无实质输出）后，把上一条 user 消息
+        // 从服务端上下文删除，并把文本恢复到输入框（Claude Code 的 rewind 行为）。
+        // 这样用户重新输入新提示词时，模型不会看到"已放弃"的旧请求并继续执行它。
+        // 必须在 flushInterrupted（会清空 data）之前调用。
+        const autoRestoreInterruptedTurn = () => {
+          // 仅当本回合确实以"无 finish 无 error"的半截结束（用户中断）才恢复。
+          if (!state.interruptedTurn) {
+            input.trace?.write("turn.autoRestore.gate", {
+              gate: "interruptedTurn",
+              value: false,
+            })
+            return
+          }
+          if (input.footer.isClosed) {
+            input.trace?.write("turn.autoRestore.gate", {
+              gate: "footerClosed",
+              value: true,
+            })
+            return
+          }
+          // 用户正在输入新内容时不打扰（避免覆盖其输入）。
+          if (input.footer.draftText().trim().length > 0) {
+            input.trace?.write("turn.autoRestore.gate", {
+              gate: "draftText",
+              draft: input.footer.draftText(),
+            })
+            return
+          }
+          const data = state.data
+          // 半截有实质输出（文本/工具调用）：服务端 finalize 已将其洗白为完成，
+          // 属于"保留结果"而非"放弃重来"，不恢复。
+          if (hasMeaningfulOutput(data)) {
+            input.trace?.write("turn.autoRestore.gate", {
+              gate: "hasMeaningfulOutput",
+              value: true,
+            })
+            return
+          }
+          const user = lastUserTurn(data)
+          if (!user) {
+            input.trace?.write("turn.autoRestore.gate", {
+              gate: "lastUserTurn",
+              value: undefined,
+            })
+            return
+          }
+          let assistantID: string | undefined
+          for (const [messageID, role] of data.role) {
+            if (role === "assistant") {
+              assistantID = messageID
+            }
+          }
+          // 从上下文删除旧 user 消息与半截 assistant（服务端通过 MessageRemoved
+          // 事件真删 DB）。删除失败不阻断恢复——服务端已保证半截不会再进入模型
+          // 上下文（无 finish 无 error 被过滤），最多是旧 user 消息短暂冗余。
+          void (async () => {
+            try {
+              if (assistantID) {
+                await input.sdk.session.deleteMessage({
+                  sessionID: input.sessionID,
+                  messageID: assistantID,
+                })
+              }
+              await input.sdk.session.deleteMessage({
+                sessionID: input.sessionID,
+                messageID: user,
+              })
+              input.trace?.write("turn.autoRestore", {
+                sessionID: input.sessionID,
+                userMessageID: user,
+              })
+            } catch (error) {
+              input.trace?.write("turn.autoRestore.error", {
+                sessionID: input.sessionID,
+                error: String(error),
+              })
+            }
+          })()
+          // 把提示词拉回输入框，方便用户编辑后重新发送。SessionData 不保留
+          // user 文本，从本 turn 发送时保存的 lastUserText 恢复。
+          input.trace?.write("turn.autoRestore.restore", {
+            lastUserText: state.lastUserText,
+            assistantID,
+            userMessageID: user,
+          })
+          input.footer.restoreDraft(state.lastUserText ?? "")
+        }
+
         const flush = (type: "turn.abort" | "turn.cancel") => {
           const commits: StreamCommit[] = []
           flushInterrupted(state.data, commits)
@@ -881,6 +980,24 @@ function createLayer(input: StreamInput) {
         }
 
         const applyEvent = Effect.fn("RunStreamTransport.applyEvent")(function* (event: Event) {
+          // 记录当前 turn 最后一条 assistant 消息是否"无 finish 无 error"。
+          // 正常完成的回合结束时一定带 finish（stop/tool-calls/…），用户中断的
+          // 纯 thinking 半截则无 finish 也无 error——turn 结束后据此触发 auto-restore。
+          if (event.type === "message.updated" && event.properties.sessionID === input.sessionID) {
+            const info = event.properties.info
+            state.interruptedTurn = info.role === "assistant" && !info.finish && !info.error
+            if (info.role === "assistant") {
+              input.trace?.write("turn.interruptedTurn", {
+                messageID: info.id,
+                role: info.role,
+                finish: info.finish ?? null,
+                error: info.error ?? null,
+                timeCompleted: info.time.completed ?? null,
+                interruptedTurn: state.interruptedTurn,
+              })
+            }
+          }
+
           if (event.type === "message.part.delta" && event.properties.sessionID === input.sessionID) {
             if (replayedParts.has(event.properties.partID)) {
               const seen = state.data.text.get(event.properties.partID) ?? ""
@@ -1208,6 +1325,7 @@ function createLayer(input: StreamInput) {
           }
           state.wait = item
           state.data.announced = false
+          state.lastUserText = next.prompt.text
 
           const turn = new AbortController()
           const stop = () => {
@@ -1340,6 +1458,8 @@ function createLayer(input: StreamInput) {
                 if (state.wait === item) {
                   state.wait = undefined
                 }
+                autoRestoreInterruptedTurn()
+                state.interruptedTurn = false
                 flush("turn.abort")
                 return Effect.void
               }
@@ -1367,6 +1487,12 @@ function createLayer(input: StreamInput) {
                     if (state.wait === item) {
                       state.wait = undefined
                     }
+
+                    // 用户中断（服务端 abort → idle）或本地取消都会走到这里：
+                    // 若本回合以"无 finish 无 error"的半截结束且无实质输出，
+                    // 则恢复上一条 user 消息到输入框并把它从上下文删除。
+                    autoRestoreInterruptedTurn()
+                    state.interruptedTurn = false
 
                     if (status === "abort") {
                       flush("turn.abort")

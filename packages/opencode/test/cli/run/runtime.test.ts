@@ -127,6 +127,10 @@ function footer(): FooterApi {
       closed = true
       notify()
     },
+    restoreDraft() {},
+    draftText() {
+      return ""
+    },
   }
 }
 

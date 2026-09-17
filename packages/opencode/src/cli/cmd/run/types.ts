@@ -347,4 +347,8 @@ export type FooterApi = {
   idle(): Promise<void>
   close(): void
   destroy(): void
+  /** 恢复一条文本到输入框（auto-restore）。 */
+  restoreDraft(text: string): void
+  /** 读取当前输入框内容（用于 auto-restore 守卫）。 */
+  draftText(): string
 }

@@ -245,6 +245,14 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
       const differentModel = `${model.providerID}/${model.id}` !== `${msg.info.providerID}/${msg.info.modelID}`
       const media: Array<{ mime: string; url: string; filename?: string }> = []
 
+      // 已落库（time.completed）但无完成标记也无错误的 assistant 消息：
+      // 用户中断时纯 thinking 的半截（finalizeInterruptedAssistant 不设
+      // finish 也不设 error，但 processor.cleanup 已写入 time.completed）。
+      // 若进入模型上下文，模型会把它当作"未完成回合"继续执行——用户输入
+      // 新提示词后仍会续写旧任务。time.completed 限定只过滤"已被封存"的半截，
+      // 不会误伤仍在进行中或合成（无 time.completed）的合法 assistant 消息。
+      if (!msg.info.finish && !msg.info.error && msg.info.time.completed) continue
+
       if (
         msg.info.error &&
         !(
@@ -323,28 +331,19 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
             })
           }
           if (part.state.status === "error") {
-            const output = part.state.metadata?.interrupted === true ? part.state.metadata.output : undefined
-            if (typeof output === "string") {
-              assistantMessage.parts.push({
-                type: ("tool-" + part.tool) as `tool-${string}`,
-                state: "output-available",
-                toolCallId: part.callID,
-                input: part.state.input,
-                output,
-                ...(part.metadata?.providerExecuted ? { providerExecuted: true } : {}),
-                ...(differentModel ? {} : { callProviderMetadata: providerMeta(part.metadata) }),
-              })
-            } else {
-              assistantMessage.parts.push({
-                type: ("tool-" + part.tool) as `tool-${string}`,
-                state: "output-error",
-                toolCallId: part.callID,
-                input: part.state.input,
-                errorText: part.state.error,
-                ...(part.metadata?.providerExecuted ? { providerExecuted: true } : {}),
-                ...(differentModel ? {} : { callProviderMetadata: providerMeta(part.metadata) }),
-              })
-            }
+            // 用户中断时被中止的工具调用（processor.cleanup 标记 interrupted:true）：
+            // 不进入模型上下文。若作为 output-error 保留，模型会看到"工具失败"，
+            // 倾向于继续尝试旧任务的工具流程；中断后应让模型专注于用户的新输入。
+            if (part.state.metadata?.interrupted === true) continue
+            assistantMessage.parts.push({
+              type: ("tool-" + part.tool) as `tool-${string}`,
+              state: "output-error",
+              toolCallId: part.callID,
+              input: part.state.input,
+              errorText: part.state.error,
+              ...(part.metadata?.providerExecuted ? { providerExecuted: true } : {}),
+              ...(differentModel ? {} : { callProviderMetadata: providerMeta(part.metadata) }),
+            })
           }
           // Handle pending/running tool calls to prevent dangling tool_use blocks
           // Anthropic/Claude APIs require every tool_use to have a corresponding tool_result

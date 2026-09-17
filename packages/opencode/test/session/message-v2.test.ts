@@ -890,7 +890,7 @@ describe("session.message-v2.toModelMessage", () => {
     ])
   })
 
-  test("forwards partial bash output for aborted tool calls", async () => {
+  test("excludes interrupted tool parts from model context, keeping any text", async () => {
     const userID = "m-user"
     const assistantID = "m-assistant"
     const output = [
@@ -919,6 +919,11 @@ describe("session.message-v2.toModelMessage", () => {
         parts: [
           {
             ...basePart(assistantID, "a1"),
+            type: "text",
+            text: "I'll run the command",
+          },
+          {
+            ...basePart(assistantID, "a2"),
             type: "tool",
             callID: "call-1",
             tool: "bash",
@@ -934,6 +939,8 @@ describe("session.message-v2.toModelMessage", () => {
       },
     ]
 
+    // 用户中断时被中止的工具调用不进入模型上下文（否则模型会看到"工具失败"
+    // 并倾向于继续旧任务的工具流程）；同回合的文本保留。
     expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([
       {
         role: "user",
@@ -941,26 +948,50 @@ describe("session.message-v2.toModelMessage", () => {
       },
       {
         role: "assistant",
-        content: [
+        content: [{ type: "text", text: "I'll run the command" }],
+      },
+    ])
+  })
+
+  test("drops assistant turns made only of interrupted tool parts", async () => {
+    const userID = "m-user"
+    const assistantID = "m-assistant"
+
+    const input: SessionV1.WithParts[] = [
+      {
+        info: userInfo(userID),
+        parts: [
           {
-            type: "tool-call",
-            toolCallId: "call-1",
-            toolName: "bash",
-            input: { command: "for i in {1..20}; do print -- $RANDOM; sleep 1; done" },
-            providerExecuted: undefined,
+            ...basePart(userID, "u1"),
+            type: "text",
+            text: "run tool",
           },
-        ],
+        ] as SessionV1.Part[],
       },
       {
-        role: "tool",
-        content: [
+        info: assistantInfo(assistantID, userID),
+        parts: [
           {
-            type: "tool-result",
-            toolCallId: "call-1",
-            toolName: "bash",
-            output: { type: "text", value: output },
+            ...basePart(assistantID, "a1"),
+            type: "tool",
+            callID: "call-1",
+            tool: "read",
+            state: {
+              status: "error",
+              input: { filePath: "/tmp/x" },
+              error: "Tool execution aborted",
+              metadata: { interrupted: true },
+              time: { start: 0, end: 1 },
+            },
           },
-        ],
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([
+      {
+        role: "user",
+        content: [{ type: "text", text: "run tool" }],
       },
     ])
   })
@@ -1037,6 +1068,86 @@ describe("session.message-v2.toModelMessage", () => {
           { type: "reasoning", text: "thinking", providerOptions: undefined },
           { type: "text", text: "partial answer" },
         ],
+      },
+    ])
+  })
+
+  test("drops finalized assistant halves with no finish and no error (interrupted pure thinking)", async () => {
+    const userID = "m-user"
+    const assistantID = "m-assistant"
+
+    const input: SessionV1.WithParts[] = [
+      {
+        info: userInfo(userID),
+        parts: [
+          {
+            ...basePart(userID, "u1"),
+            type: "text",
+            text: "user prompt",
+          },
+        ] as SessionV1.Part[],
+      },
+      {
+        info: {
+          ...assistantInfo(assistantID, userID),
+          time: { created: 0, completed: 1 },
+        } as SessionV1.Assistant,
+        parts: [
+          {
+            ...basePart(assistantID, "a1"),
+            type: "reasoning",
+            text: "thinking",
+            time: { start: 0, end: 1 },
+          },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    // 用户中断的纯 thinking 半截：已落库（time.completed）但无 finish 也无
+    // error。若进入模型上下文会被当作"未完成回合"而续写旧任务，故剔除。
+    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([
+      {
+        role: "user",
+        content: [{ type: "text", text: "user prompt" }],
+      },
+    ])
+  })
+
+  test("keeps assistant halves without finish/error when they are not finalized (no time.completed)", async () => {
+    const userID = "m-user"
+    const assistantID = "m-assistant"
+
+    const input: SessionV1.WithParts[] = [
+      {
+        info: userInfo(userID),
+        parts: [
+          {
+            ...basePart(userID, "u1"),
+            type: "text",
+            text: "user prompt",
+          },
+        ] as SessionV1.Part[],
+      },
+      {
+        info: assistantInfo(assistantID, userID),
+        parts: [
+          {
+            ...basePart(assistantID, "a1"),
+            type: "text",
+            text: "partial answer",
+          },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([
+      {
+        role: "user",
+        content: [{ type: "text", text: "user prompt" }],
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "partial answer" }],
       },
     ])
   })

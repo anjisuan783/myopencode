@@ -881,11 +881,10 @@ it.live("session.processor effect tests mark pending tools as aborted on cleanup
   ),
 )
 
-it.live("session.processor effect tests record aborted errors and idle state", () =>
+it.live("session.processor effect tests interrupt goes idle without marking an aborted error", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>
       Effect.gen(function* () {
-        const seen = defer<void>()
         const { processors, session, provider } = yield* boot()
         const events = yield* EventV2Bridge.Service
         const sts = yield* SessionStatus.Service
@@ -902,7 +901,6 @@ it.live("session.processor effect tests record aborted errors and idle state", (
           const data = evt.data as typeof Session.Event.Error.data.Type
           if (data.sessionID !== chat.id || !data.error) return Effect.void
           errs.push(data.error.name)
-          seen.resolve()
           return Effect.void
         })
         const handle = yield* processors.create({
@@ -934,22 +932,24 @@ it.live("session.processor effect tests record aborted errors and idle state", (
         yield* Fiber.interrupt(run)
 
         const exit = yield* Fiber.await(run)
-        yield* Effect.promise(() => seen.promise)
         const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
         const state = yield* sts.get(chat.id)
         yield* off
 
+        // 用户中断不是模型错误：消息不带 AbortedError，也不发布 error 事件。
+        // 半截的归属（保留为已完成 or 过滤）由 prompt 层的 finalize 决定，
+        // 这里只保证状态回到 idle。
         expect(Exit.isFailure(exit)).toBe(true)
         if (Exit.isFailure(exit)) {
           expect(Cause.hasInterruptsOnly(exit.cause)).toBe(true)
         }
-        expect(handle.message.error?.name).toBe("MessageAbortedError")
+        expect(handle.message.error).toBeUndefined()
         expect(stored.info.role).toBe("assistant")
         if (stored.info.role === "assistant") {
-          expect(stored.info.error?.name).toBe("MessageAbortedError")
+          expect(stored.info.error).toBeUndefined()
         }
         expect(state).toMatchObject({ type: "idle" })
-        expect(errs).toContain("MessageAbortedError")
+        expect(errs).toEqual([])
       }),
     { config: (url) => providerCfg(url) },
   ),
@@ -1001,10 +1001,10 @@ it.live("session.processor effect tests mark interruptions aborted without manua
         const state = yield* sts.get(chat.id)
 
         expect(Exit.isFailure(exit)).toBe(true)
-        expect(handle.message.error?.name).toBe("MessageAbortedError")
+        expect(handle.message.error).toBeUndefined()
         expect(stored.info.role).toBe("assistant")
         if (stored.info.role === "assistant") {
-          expect(stored.info.error?.name).toBe("MessageAbortedError")
+          expect(stored.info.error).toBeUndefined()
         }
         expect(state).toMatchObject({ type: "idle" })
       }),

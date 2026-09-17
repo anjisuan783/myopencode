@@ -1144,7 +1144,7 @@ it.instance("cancel interrupts loop and resolves with an assistant message", () 
   }),
 )
 
-it.instance("cancel records MessageAbortedError on interrupted process", () =>
+it.instance("cancel interrupts the process without recording an aborted error", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
     const prompt = yield* SessionPrompt.Service
@@ -1162,7 +1162,8 @@ it.instance("cancel records MessageAbortedError on interrupted process", () =>
     if (Exit.isSuccess(exit)) {
       const info = exit.value.info
       if (info.role === "assistant") {
-        expect(info.error?.name).toBe("MessageAbortedError")
+        expect(info.error).toBeUndefined()
+        expect(info.finish).toBeUndefined()
       }
     }
   }),
@@ -1206,7 +1207,7 @@ raceNoLLMServer.instance(
       if (firstInterrupted?.info.role === "assistant") {
         expect(firstInterrupted.info.finish).toBeUndefined()
         expect(firstInterrupted.info.time.completed).toBeNumber()
-        expect(firstInterrupted.info.error?.name).toBe("MessageAbortedError")
+        expect(firstInterrupted.info.error).toBeUndefined()
       }
 
       yield* prompt.prompt({
@@ -1241,7 +1242,7 @@ raceNoLLMServer.instance(
           message.info.role === "assistant" &&
           message.parts.length === 0 &&
           message.info.time.completed &&
-          message.info.error?.name === "MessageAbortedError",
+          message.info.error === undefined,
       )
       expect(interruptedMessages).toHaveLength(2)
 
@@ -2243,7 +2244,7 @@ it.instance("does not loop empty assistant turns for a simple reply", () =>
   }),
 )
 
-it.instance("records aborted errors when prompt is cancelled mid-stream", () =>
+it.instance("cancel mid-stream leaves the half without an aborted error", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
     const prompt = yield* SessionPrompt.Service
@@ -2269,7 +2270,8 @@ it.instance("records aborted errors when prompt is cancelled mid-stream", () =>
     if (Exit.isSuccess(exit)) {
       expect(exit.value.info.role).toBe("assistant")
       if (exit.value.info.role === "assistant") {
-        expect(exit.value.info.error?.name).toBe("MessageAbortedError")
+        expect(exit.value.info.error).toBeUndefined()
+        expect(exit.value.info.finish).toBeUndefined()
       }
     }
 
@@ -2277,7 +2279,7 @@ it.instance("records aborted errors when prompt is cancelled mid-stream", () =>
     const last = msgs.findLast((msg) => msg.info.role === "assistant")
     expect(last?.info.role).toBe("assistant")
     if (last?.info.role === "assistant") {
-      expect(last.info.error?.name).toBe("MessageAbortedError")
+      expect(last.info.error).toBeUndefined()
     }
   }),
 )

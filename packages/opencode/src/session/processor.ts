@@ -648,8 +648,13 @@ const layer = Layer.effect(
             Effect.onInterrupt(() =>
               Effect.gen(function* () {
                 aborted = true
+                // 用户中断不是模型错误：不设置 AbortedError。半截消息的归属由
+                // prompt.ts 的 finalizeInterruptedAssistant 决定——有实质输出则视为
+                // 完成（finish="stop"），纯 thinking 则保持无 finish 状态被模型上下文
+                // 过滤。若这里标记 AbortedError，模型会把它当作"未完成任务"继续执行，
+                // 导致用户输入新提示词后仍回答旧任务。这里只需保证状态回到 idle。
                 if (!ctx.assistantMessage.error) {
-                  yield* halt(new DOMException("Aborted", "AbortError"))
+                  yield* status.set(ctx.sessionID, { type: "idle" })
                 }
               }),
             ),

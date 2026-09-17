@@ -20,6 +20,8 @@ function footer() {
     idle: () => Promise.resolve(),
     close: () => {},
     destroy: () => {},
+    restoreDraft: () => {},
+    draftText: () => "",
   }
 
   return { api, events, commits }

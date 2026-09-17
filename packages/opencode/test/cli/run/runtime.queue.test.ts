@@ -61,6 +61,10 @@ function footer() {
       prompts.clear()
       closes.clear()
     },
+    restoreDraft() {},
+    draftText() {
+      return ""
+    },
   }
 
   return {

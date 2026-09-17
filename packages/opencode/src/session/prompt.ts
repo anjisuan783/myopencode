@@ -1201,11 +1201,27 @@ const layer = Layer.effect(
           yield* sessions.updateMessage(msg)
 
           const finalizeInterruptedAssistant = Effect.gen(function* () {
-            if (msg.time.completed) return
-            msg.error ??= MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
-              providerID: msg.providerID,
-              aborted: true,
-            })
+            // 注意：不能用 msg.time.completed 作守卫。processor 的 cleanup 在
+            // 中断 finalizer 链里先于本函数执行，且无条件设置 time.completed，
+            // 用它作守卫会让下面的逻辑永远短路。只有消息已带有终态（finish 或
+            // error）才说明它已经正常结束，无需再处理。
+            if (msg.finish || msg.error) return
+            // processor 的 cleanup 已在中断时把半截文本/工具调用写入 DB，
+            // 这里从 DB 读该消息的 parts 判断是否有实质输出：
+            // - 有 text（非空）或 tool 调用 → 视为正常完成（finish="stop"），
+            //   不再标记 AbortedError。模型上下文里它是一条"已结束"的回合，
+            //   用户随后输入新提示词会被正常响应，而不是续写旧任务。
+            // - 纯 thinking（只有 reasoning/step-start）→ 不设 finish 也不设
+            //   error，toModelMessagesEffect 会将其过滤出模型上下文；CLI 侧
+            //   auto-restore 会删除该半截消息与上一条 user 消息并恢复输入。
+            const found = yield* sessions.findMessage(sessionID, (m) => m.info.id === msg.id).pipe(Effect.orDie)
+            const parts = Option.isSome(found) ? found.value.parts : []
+            const hasOutput = parts.some(
+              (p) => (p.type === "text" && p.text.trim().length > 0) || p.type === "tool",
+            )
+            if (hasOutput) {
+              msg.finish ??= "stop"
+            }
             msg.time.completed = Date.now()
             yield* sessions.updateMessage(msg)
           })

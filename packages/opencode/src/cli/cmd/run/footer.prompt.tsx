@@ -95,6 +95,7 @@ export type PromptState = {
   onKeyDown: (event: KeyEvent) => void
   onContentChange: () => void
   replaceDraft: (text: string) => void
+  draftText: () => string
   replacePrompt: (prompt: RunPrompt) => void
   bind: (area?: TextareaRenderable) => void
 }
@@ -635,6 +636,14 @@ export function createPromptState(input: PromptInput): PromptState {
     area.cursorOffset = Math.min(Bun.stringWidth(text), Bun.stringWidth(area.plainText))
     scheduleRows()
     area.focus()
+  }
+
+  // 读取当前输入框内容（auto-restore 前判断用户是否正在输入，避免覆盖）。
+  const draftText = () => {
+    if (area && !area.isDestroyed) {
+      return area.plainText
+    }
+    return draft.text
   }
 
   const refresh = () => {
@@ -1300,6 +1309,7 @@ export function createPromptState(input: PromptInput): PromptState {
       scheduleRows()
     },
     replaceDraft,
+    draftText,
     replacePrompt: restore,
     bind,
   }

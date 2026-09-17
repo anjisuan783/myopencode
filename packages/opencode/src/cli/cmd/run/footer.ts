@@ -32,7 +32,7 @@ import { createStore, reconcile } from "solid-js/store"
 import { OpencodeKeymapProvider } from "@opencode-ai/tui/keymap"
 import { RUN_COMMAND_PANEL_ROWS, RUN_SUBAGENT_PANEL_ROWS } from "./footer.command"
 import { SUBAGENT_INSPECTOR_ROWS } from "./footer.subagent"
-import { PROMPT_MAX_ROWS, TEXTAREA_MIN_ROWS } from "./footer.prompt"
+import { PROMPT_MAX_ROWS, TEXTAREA_MIN_ROWS, type PromptState } from "./footer.prompt"
 import { RunFooterView } from "./footer.view"
 import { RunScrollbackStream } from "./scrollback.surface"
 import { RUN_THEME_FALLBACK, resolveRunTheme, type RunTheme } from "./theme"
@@ -205,6 +205,9 @@ export class RunFooter implements FooterApi {
   private promptRoute: FooterPromptRoute = { type: "composer" }
   private subagentMenuRows = SUBAGENT_ROWS
   private autocomplete = false
+  // 输入框（composer）实例，由 RunFooterView 渲染后通过 onComposerReady 注册，
+  // 供 auto-restore 读取/恢复 draft。
+  private composer: PromptState | undefined
   private interruptTimeout: NodeJS.Timeout | undefined
   private exitTimeout: NodeJS.Timeout | undefined
   private noticeTimeout: NodeJS.Timeout | undefined
@@ -342,6 +345,9 @@ export class RunFooter implements FooterApi {
               onStatus: footer.setStatus,
               onSubagentSelect: options.onSubagentSelect,
               onQueuedRemove: footer.handleQueuedRemove,
+              onComposerReady: (composer: PromptState) => {
+                footer.composer = composer
+              },
             })
           },
         }),
@@ -373,6 +379,19 @@ export class RunFooter implements FooterApi {
     return () => {
       this.queuedRemoves.delete(fn)
     }
+  }
+
+  /**
+   * 恢复一条文本到输入框（auto-restore：用户中断纯 thinking 的旧任务后，
+   * 把刚才输入的提示词拉回来，方便编辑后重新发送）。
+   */
+  public restoreDraft(text: string): void {
+    this.composer?.replaceDraft(text)
+  }
+
+  /** 读取当前输入框内容，用于判断用户是否正在输入。 */
+  public draftText(): string {
+    return this.composer?.draftText() ?? ""
   }
 
   public onClose(fn: () => void): () => void {

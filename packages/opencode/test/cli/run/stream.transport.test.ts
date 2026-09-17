@@ -99,6 +99,30 @@ function assistant(id: string) {
   } satisfies SdkEvent
 }
 
+function user(id: string) {
+  return {
+    id: `evt-${id}`,
+    type: "message.updated",
+    properties: {
+      sessionID: "session-1",
+      info: {
+        id,
+        sessionID: "session-1",
+        role: "user",
+        time: { created: 1 },
+        parentID: "msg-parent-1",
+        modelID: "gpt-5",
+        providerID: "openai",
+        mode: "user",
+        agent: "user",
+        path: { cwd: "/tmp", root: "/tmp" },
+        model: { providerID: "openai", modelID: "gpt-5" },
+        tools: {},
+      } as SessionMessage["info"],
+    },
+  } satisfies SdkEvent
+}
+
 const StreamClosed = undefined as never
 
 function feed<T, R = never>(returnValue: R = StreamClosed) {
@@ -374,6 +398,8 @@ function globalEvent(payload: GlobalEvent["payload"]): GlobalEvent {
 function footer(fn?: (commit: StreamCommit) => void) {
   const commits: StreamCommit[] = []
   const events: FooterEvent[] = []
+  const drafts: string[] = []
+  let draft = ""
   let closed = false
   let idleCalls = 0
 
@@ -401,12 +427,23 @@ function footer(fn?: (commit: StreamCommit) => void) {
     destroy() {
       closed = true
     },
+    restoreDraft(text) {
+      drafts.push(text)
+      draft = text
+    },
+    draftText() {
+      return draft
+    },
   }
 
   return {
     api,
     commits,
     events,
+    drafts,
+    setDraft(text: string) {
+      draft = text
+    },
     get idleCalls() {
       return idleCalls
     },
@@ -425,6 +462,7 @@ function sdk(
     children?: OpencodeClient["session"]["children"]
     permissions?: OpencodeClient["permission"]["list"]
     questions?: OpencodeClient["question"]["list"]
+    deleteMessage?: OpencodeClient["session"]["deleteMessage"]
   } = {},
 ) {
   const client = new OpencodeClient()
@@ -438,6 +476,7 @@ function sdk(
   const children: OpencodeClient["session"]["children"] = input.children ?? (() => ok([]))
   const permissions: OpencodeClient["permission"]["list"] = input.permissions ?? (() => ok([]))
   const questions: OpencodeClient["question"]["list"] = input.questions ?? (() => ok([]))
+  const deleteMessage: OpencodeClient["session"]["deleteMessage"] = input.deleteMessage ?? (() => ok(true))
 
   spyOn(client.event, "subscribe").mockImplementation(subscribe)
   spyOn(client.global, "event").mockImplementation(globalEvent)
@@ -447,6 +486,7 @@ function sdk(
   spyOn(client.session, "children").mockImplementation(children)
   spyOn(client.permission, "list").mockImplementation(permissions)
   spyOn(client.question, "list").mockImplementation(questions)
+  spyOn(client.session, "deleteMessage").mockImplementation(deleteMessage)
 
   return client
 }
@@ -2355,6 +2395,239 @@ describe("run stream transport", () => {
 
       ctrl.abort()
       await task
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("auto-restores an interrupted pure-thinking turn into the input box and deletes it from context", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const deleted: string[] = []
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        stream: src.stream,
+        promptAsync: async () => {
+          queueMicrotask(() => {
+            src.push(busy())
+            src.push(user("msg-user-1"))
+            src.push(assistant("msg-a1"))
+            src.push(reasoningUpdated(reasoningPart("reason-1", "msg-a1", "thinking")))
+          })
+          return ok(undefined)
+        },
+        deleteMessage: async ({ messageID }) => {
+          deleted.push(messageID)
+          return ok(true)
+        },
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+
+    const ctrl = new AbortController()
+
+    try {
+      const run = transport.runPromptTurn({
+        agent: undefined,
+        model: undefined,
+        variant: undefined,
+        prompt: { text: "fix the bug", parts: [] },
+        files: [],
+        includeFiles: false,
+        signal: ctrl.signal,
+      })
+
+      await waitFor(() =>
+        ui.commits.some((commit) => commit.kind === "reasoning" && commit.messageID === "msg-a1") ? true : undefined,
+      )
+
+      ctrl.abort()
+      await run
+
+      await waitFor(() => (deleted.length === 2 ? true : undefined))
+      expect(ui.drafts).toEqual(["fix the bug"])
+      expect(deleted).toEqual(["msg-a1", "msg-user-1"])
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("does not auto-restore an interrupted turn that produced text", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const deleted: string[] = []
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        stream: src.stream,
+        promptAsync: async () => {
+          queueMicrotask(() => {
+            src.push(busy())
+            src.push(user("msg-user-1"))
+            src.push(assistant("msg-a1"))
+            src.push(textUpdated(textPart("text-1", "msg-a1", "partial answer")))
+          })
+          return ok(undefined)
+        },
+        deleteMessage: async ({ messageID }) => {
+          deleted.push(messageID)
+          return ok(true)
+        },
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+
+    const ctrl = new AbortController()
+
+    try {
+      const run = transport.runPromptTurn({
+        agent: undefined,
+        model: undefined,
+        variant: undefined,
+        prompt: { text: "fix the bug", parts: [] },
+        files: [],
+        includeFiles: false,
+        signal: ctrl.signal,
+      })
+
+      await waitFor(() =>
+        ui.commits.some((commit) => commit.kind === "assistant" && commit.messageID === "msg-a1") ? true : undefined,
+      )
+
+      ctrl.abort()
+      await run
+
+      expect(ui.drafts).toEqual([])
+      expect(deleted).toEqual([])
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("does not auto-restore an interrupted turn with a running tool", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const deleted: string[] = []
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        stream: src.stream,
+        promptAsync: async () => {
+          queueMicrotask(() => {
+            src.push(busy())
+            src.push(user("msg-user-1"))
+            src.push(assistant("msg-a1"))
+            src.push(
+              toolUpdated(
+                runningTool({
+                  sessionID: "session-1",
+                  messageID: "msg-a1",
+                  id: "tool-1",
+                  callID: "call-1",
+                  tool: "read",
+                  body: { filePath: "/tmp/x" },
+                }),
+              ),
+            )
+          })
+          return ok(undefined)
+        },
+        deleteMessage: async ({ messageID }) => {
+          deleted.push(messageID)
+          return ok(true)
+        },
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+
+    const ctrl = new AbortController()
+
+    try {
+      const run = transport.runPromptTurn({
+        agent: undefined,
+        model: undefined,
+        variant: undefined,
+        prompt: { text: "fix the bug", parts: [] },
+        files: [],
+        includeFiles: false,
+        signal: ctrl.signal,
+      })
+
+      await waitFor(() =>
+        ui.commits.some((commit) => commit.kind === "tool" && commit.partID === "tool-1") ? true : undefined,
+      )
+
+      ctrl.abort()
+      await run
+
+      expect(ui.drafts).toEqual([])
+      expect(deleted).toEqual([])
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("does not auto-restore over a non-empty draft", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    ui.setDraft("a new prompt")
+    const deleted: string[] = []
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        stream: src.stream,
+        promptAsync: async () => {
+          queueMicrotask(() => {
+            src.push(busy())
+            src.push(user("msg-user-1"))
+            src.push(assistant("msg-a1"))
+            src.push(reasoningUpdated(reasoningPart("reason-1", "msg-a1", "thinking")))
+          })
+          return ok(undefined)
+        },
+        deleteMessage: async ({ messageID }) => {
+          deleted.push(messageID)
+          return ok(true)
+        },
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+
+    const ctrl = new AbortController()
+
+    try {
+      const run = transport.runPromptTurn({
+        agent: undefined,
+        model: undefined,
+        variant: undefined,
+        prompt: { text: "fix the bug", parts: [] },
+        files: [],
+        includeFiles: false,
+        signal: ctrl.signal,
+      })
+
+      await waitFor(() =>
+        ui.commits.some((commit) => commit.kind === "reasoning" && commit.messageID === "msg-a1") ? true : undefined,
+      )
+
+      ctrl.abort()
+      await run
+
+      expect(ui.drafts).toEqual([])
+      expect(deleted).toEqual([])
     } finally {
       src.close()
       await transport.close()

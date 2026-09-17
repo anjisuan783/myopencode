@@ -1111,3 +1111,34 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
 
   return out(data, commits)
 }
+
+// ─── Auto-restore helpers ────────────────────────────────────────────────────
+// 用户中断纯 thinking 的旧任务后（无实质输出），CLI 把上一条 user 消息从
+// 上下文删除并恢复到输入框（对应 Claude Code 的 rewind 行为）。以下函数基于
+// 中断前的 SessionData 判断"半截是否有实质输出"与"最后一条 user 消息"。
+// 必须在 flushInterrupted（会清空 data）之前调用。
+
+/** 被中断的回合是否有实质输出：非空 assistant 文本或进行中的工具调用。 */
+export function hasMeaningfulOutput(data: SessionData): boolean {
+  for (const [partID, kind] of data.part) {
+    if (kind !== "assistant") {
+      continue
+    }
+    const text = data.text.get(partID)
+    if (text && text.trim().length > 0) {
+      return true
+    }
+  }
+  return data.tools.size > 0
+}
+
+/** 最后一条 user 消息的 messageID（按事件到达顺序取最新）。 */
+export function lastUserTurn(data: SessionData): string | undefined {
+  let last: string | undefined
+  for (const [messageID, role] of data.role) {
+    if (role === "user") {
+      last = messageID
+    }
+  }
+  return last
+}
