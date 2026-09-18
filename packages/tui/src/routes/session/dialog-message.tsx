@@ -6,6 +6,8 @@ import { useRoute } from "../../context/route"
 import { useClipboard } from "../../context/clipboard"
 import type { PromptInfo } from "../../component/prompt/history"
 import { stripPromptPartIDs as strip } from "../../prompt/part"
+import { useToast } from "../../ui/toast"
+import { errorMessage } from "../../util/error"
 
 export function DialogMessage(props: {
   messageID: string
@@ -17,6 +19,7 @@ export function DialogMessage(props: {
   const message = createMemo(() => sync.data.message[props.sessionID]?.find((x) => x.id === props.messageID))
   const route = useRoute()
   const clipboard = useClipboard()
+  const toast = useToast()
 
   return (
     <DialogSelect
@@ -101,6 +104,35 @@ export function DialogMessage(props: {
               prompt,
             })
             dialog.clear()
+          },
+        },
+        {
+          title: "Delete",
+          value: "message.delete",
+          description: "remove this turn from context",
+          onSelect: async (dialog) => {
+            const msg = message()
+            if (!msg) return
+
+            const replies = (sync.data.message[props.sessionID] ?? []).filter(
+              (x) => x.role === "assistant" && x.parentID === msg.id,
+            )
+
+            try {
+              for (const reply of replies) {
+                await sdk.client.session.deleteMessage(
+                  { sessionID: props.sessionID, messageID: reply.id },
+                  { throwOnError: true },
+                )
+              }
+              await sdk.client.session.deleteMessage(
+                { sessionID: props.sessionID, messageID: msg.id },
+                { throwOnError: true },
+              )
+              dialog.clear()
+            } catch (error) {
+              toast.show({ message: errorMessage(error), variant: "error", duration: 5000 })
+            }
           },
         },
       ]}
