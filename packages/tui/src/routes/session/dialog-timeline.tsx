@@ -1,22 +1,30 @@
-import { createMemo, onMount } from "solid-js"
+import { createMemo, createSignal, onMount } from "solid-js"
 import { useSync } from "../../context/sync"
 import { DialogSelect, type DialogSelectOption } from "../../ui/dialog-select"
 import type { TextPart } from "@opencode-ai/sdk/v2"
 import { Locale } from "../../util/locale"
-import { DialogMessage } from "./dialog-message"
 import { useDialog } from "../../ui/dialog"
-import type { PromptInfo } from "../../component/prompt/history"
+import { useSDK } from "../../context/sdk"
+import { useToast } from "../../ui/toast"
+import { useTheme } from "../../context/theme"
+import { useCommandShortcut } from "../../keymap"
+import { deleteTurn } from "./delete-turn"
 
 export function DialogTimeline(props: {
   sessionID: string
   onMove: (messageID: string) => void
-  setPrompt?: (prompt: PromptInfo) => void
 }) {
   const sync = useSync()
   const dialog = useDialog()
+  const sdk = useSDK()
+  const toast = useToast()
+  const { theme } = useTheme()
+  const deleteHint = useCommandShortcut("session.timeline.delete")
+  const [toDelete, setToDelete] = createSignal<string>()
 
   onMount(() => {
     dialog.setSize("large")
+    dialog.setTranslucent(true)
   })
 
   const options = createMemo((): DialogSelectOption<string>[] => {
@@ -28,14 +36,15 @@ export function DialogTimeline(props: {
         (x) => x.type === "text" && !x.synthetic && !x.ignored,
       ) as TextPart
       if (!part) continue
+      const isDeleting = toDelete() === message.id
       result.push({
-        title: part.text.replace(/\n/g, " "),
+        title: isDeleting ? `Press ${deleteHint()} again to confirm` : part.text.replace(/\n/g, " "),
+        bg: isDeleting ? theme.error : undefined,
         value: message.id,
         footer: Locale.time(message.time.created),
-        onSelect: (dialog) => {
-          dialog.replace(() => (
-            <DialogMessage messageID={message.id} sessionID={props.sessionID} setPrompt={props.setPrompt} />
-          ))
+        onSelect: () => {
+          props.onMove(message.id)
+          dialog.clear()
         },
       })
     }
@@ -43,5 +52,34 @@ export function DialogTimeline(props: {
     return result
   })
 
-  return <DialogSelect onMove={(option) => props.onMove(option.value)} title="Timeline" options={options()} />
+  return (
+    <DialogSelect
+      onMove={(option) => {
+        setToDelete(undefined)
+        props.onMove(option.value)
+      }}
+      title="Timeline"
+      options={options()}
+      actions={[
+        {
+          command: "session.timeline.delete",
+          title: "delete",
+          onTrigger: async (option) => {
+            if (toDelete() !== option.value) {
+              setToDelete(option.value)
+              return
+            }
+            setToDelete(undefined)
+            await deleteTurn({
+              sync,
+              sdk,
+              toast,
+              sessionID: props.sessionID,
+              messageID: option.value,
+            })
+          },
+        },
+      ]}
+    />
+  )
 }

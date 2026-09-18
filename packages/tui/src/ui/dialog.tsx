@@ -11,6 +11,7 @@ import { useClipboard } from "../context/clipboard"
 export function Dialog(
   props: ParentProps<{
     size?: "medium" | "large" | "xlarge"
+    translucent?: boolean
     onClose: () => void
   }>,
 ) {
@@ -24,6 +25,10 @@ export function Dialog(
     if (props.size === "large") return 88
     return 60
   }
+  const panel = () =>
+    props.translucent
+      ? RGBA.fromValues(theme.backgroundPanel.r, theme.backgroundPanel.g, theme.backgroundPanel.b, theme.backgroundPanel.a * 0.5)
+      : theme.backgroundPanel
 
   return (
     <box
@@ -45,7 +50,7 @@ export function Dialog(
       paddingTop={dimensions().height / 4}
       left={0}
       top={0}
-      backgroundColor={RGBA.fromInts(0, 0, 0, 150)}
+      backgroundColor={RGBA.fromInts(0, 0, 0, props.translucent ? 60 : 150)}
     >
       <box
         onMouseUp={(e: { stopPropagation(): void }) => {
@@ -57,7 +62,7 @@ export function Dialog(
         }}
         width={width()}
         maxWidth={dimensions().width - 2}
-        backgroundColor={theme.backgroundPanel}
+        backgroundColor={panel()}
         paddingTop={1}
       >
         {props.children}
@@ -73,6 +78,7 @@ function init() {
       onClose?: () => void
     }[],
     size: "medium" as "medium" | "large" | "xlarge",
+    translucent: false,
   })
 
   const renderer = useRenderer()
@@ -143,6 +149,7 @@ function init() {
       }
       batch(() => {
         setStore("size", "medium")
+        setStore("translucent", false)
         setStore("stack", [])
       })
       refocus()
@@ -156,6 +163,7 @@ function init() {
         if (item.onClose) item.onClose()
       }
       setStore("size", "medium")
+      setStore("translucent", false)
       setStore("stack", [
         {
           element: input,
@@ -171,6 +179,12 @@ function init() {
     },
     setSize(size: "medium" | "large" | "xlarge") {
       setStore("size", size)
+    },
+    get translucent() {
+      return store.translucent
+    },
+    setTranslucent(translucent: boolean) {
+      setStore("translucent", translucent)
     },
   }
 }
@@ -213,7 +227,7 @@ export function DialogProvider(props: ParentProps) {
         onMouseUp={!Flag.OPENCODE_EXPERIMENTAL_DISABLE_COPY_ON_SELECT ? copySelection : undefined}
       >
         <Show when={value.stack.length}>
-          <Dialog onClose={() => value.clear()} size={value.size}>
+          <Dialog onClose={() => value.clear()} size={value.size} translucent={value.translucent}>
             {value.stack.at(-1)!.element}
           </Dialog>
         </Show>
