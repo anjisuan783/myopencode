@@ -57,6 +57,7 @@ import { usePromptWorkspace } from "./workspace"
 import { usePromptMove } from "./move"
 import { readLocalAttachment } from "./local-attachment"
 import { useLocation } from "../../context/location"
+import { autoRestoreInterruptedTurn } from "../../routes/session/auto-restore"
 
 registerOpencodeSpinner()
 
@@ -412,10 +413,23 @@ export function Prompt(props: PromptProps) {
           }, 5000)
 
           if (store.interrupt >= 2) {
-            void sdk.client.session.abort({
-              sessionID: props.sessionID,
+            const sessionID = props.sessionID
+            const anchor = sync.data.message[sessionID]?.findLast((message) => message.role === "user")
+            const abort = sdk.client.session.abort({
+              sessionID,
             })
             setStore("interrupt", 0)
+            // abort 完成后若本轮是纯 thinking 中断，删除该轮并把 prompt 回填输入框。
+            void autoRestoreInterruptedTurn({
+              sdk,
+              toast,
+              sessionID,
+              anchorUserID: anchor?.id,
+              abort,
+              isActive: () => props.sessionID === sessionID,
+              inputEmpty: () => store.prompt.input.length === 0 && input.plainText.length === 0,
+              setPrompt: (prompt) => ref.set(prompt),
+            })
           }
           dialog.clear()
         },
