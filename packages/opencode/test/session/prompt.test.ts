@@ -2284,6 +2284,60 @@ it.instance("cancel mid-stream leaves the half without an aborted error", () =>
   }),
 )
 
+it.instance("cancel finalizes an interrupted later step when the turn already produced output", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Multi-step interrupted finalize",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "hello" }],
+    })
+    yield* llm.tool("first", { value: "first" })
+    yield* llm.hang
+
+    const fiber = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
+    yield* waitForBusy(session.id)
+    yield* pollWithTimeout(
+      Effect.gen(function* () {
+        const messages = yield* sessions.messages({ sessionID: session.id })
+        const assistants = messages.filter((message) => message.info.role === "assistant")
+        return assistants.length >= 2 ? (true as const) : undefined
+      }),
+      "second assistant step never started",
+    )
+    yield* prompt.cancel(session.id)
+
+    const exit = yield* Fiber.await(fiber)
+    expect(Exit.isSuccess(exit)).toBe(true)
+
+    const messages = yield* sessions.messages({ sessionID: session.id })
+    const assistants = messages.filter((message) => message.info.role === "assistant")
+    expect(assistants).toHaveLength(2)
+
+    const first = assistants[0]
+    if (first?.info.role === "assistant") {
+      expect(first.parts.some((part) => part.type === "tool")).toBe(true)
+    }
+
+    const last = assistants.at(-1)
+    expect(last?.info.role).toBe("assistant")
+    if (last?.info.role === "assistant") {
+      // 后面这一步被中断时只有 reasoning，但整轮已有 tool 输出，仍按完成保留。
+      expect(last.info.finish).toBe("stop")
+      expect(last.info.time.completed).toBeNumber()
+      expect(last.info.error).toBeUndefined()
+    }
+  }),
+)
+
 // Agent variant
 
 noLLMServer.instance(

@@ -126,6 +126,12 @@ type State = {
   /** 当前 turn 最后一条 assistant 消息是否为"无 finish 无 error"（用户中断的纯 thinking 半截）。 */
   interruptedTurn: boolean
   /**
+   * 当前 turn 是否已产生过实质输出（非空 assistant 文本或任意工具调用）。
+   * SessionData 会在一段文本/工具结束后 drop 掉对应的 part，导致
+   * hasMeaningfulOutput 看不见"已完成"的输出；这个回合级标记跨 part 生命周期保留。
+   */
+  sawOutput: boolean
+  /**
    * 本 turn 发送的用户提示词文本。SessionData 在 includeUserText=false 时
    * 会丢弃 user 文本部分，lastUserTurn 读不到文本，auto-restore 需要这里
    * 保存的一份来恢复输入框。
@@ -461,6 +467,7 @@ function createLayer(input: StreamInput) {
           blockerTick: 0,
           blockers: new Map(),
           interruptedTurn: false,
+          sawOutput: false,
         }
         let booting = true
         let replaying = false
@@ -912,11 +919,13 @@ function createLayer(input: StreamInput) {
           }
           const data = state.data
           // 半截有实质输出（文本/工具调用）：服务端 finalize 已将其洗白为完成，
-          // 属于"保留结果"而非"放弃重来"，不恢复。
-          if (hasMeaningfulOutput(data)) {
+          // 属于"保留结果"而非"放弃重来"，不恢复。state.sawOutput 覆盖本回合已经
+          // 结束并被 drop 的输出（hasMeaningfulOutput 只能看到仍 in-flight 的部分）。
+          if (state.sawOutput || hasMeaningfulOutput(data)) {
             input.trace?.write("turn.autoRestore.gate", {
               gate: "hasMeaningfulOutput",
               value: true,
+              sawOutput: state.sawOutput,
             })
             return
           }
@@ -1020,6 +1029,14 @@ function createLayer(input: StreamInput) {
             limits: input.limits(),
           })
           state.data = next.data
+          if (
+            !state.sawOutput &&
+            next.commits.some(
+              (commit) => (commit.kind === "assistant" && commit.text.trim().length > 0) || commit.kind === "tool",
+            )
+          ) {
+            state.sawOutput = true
+          }
           const visible = next.commits.at(-1)
           if (visible) {
             state.wait?.onVisibleOutput?.({
@@ -1325,6 +1342,7 @@ function createLayer(input: StreamInput) {
           }
           state.wait = item
           state.data.announced = false
+          state.sawOutput = false
           state.lastUserText = next.prompt.text
 
           const turn = new AbortController()

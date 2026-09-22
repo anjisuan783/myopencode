@@ -19,8 +19,9 @@ let running = false
 // 因此 abort resolve 后从服务端拉取的消息即为权威判定结果，无需 timeout 或轮询。
 //
 // 判定与删除对象都以 anchorUserID（ESC 时 TUI 里最后一条 user 消息）为准：
-// - 有 reply 且 reply.finish/error 已置 → 视为正常完成/有输出，不处理；
-// - 有 reply 且无 finish/error，但 parts 含非空 text 或 tool → 兜底拦截，不处理；
+// - replies 中任意一条有 finish/error，或 parts 含非空 text 或 tool → 视为本回合
+//   已有实质输出，不处理（多步回合里最后一步可能只剩 reasoning，但更早的步骤
+//   已经有 text/tool/finish，整轮不能被当作纯 thinking 半截删除）；
 // - 无 reply（服务端还没建半截就被打断，S5）→ 同样删除该 user 并回填；
 // - fetch 结果里找不到 anchor（历史被清理/分页越界）→ 不猜测、不处理。
 export async function autoRestoreInterruptedTurn(input: {
@@ -67,12 +68,8 @@ export async function autoRestoreInterruptedTurn(input: {
       (message): message is SessionMessage & { info: AssistantInfo } =>
         message.info.role === "assistant" && message.info.parentID === input.anchorUserID,
     )
-    const reply = replies.at(-1)
-    if (reply) {
-      if (reply.info.finish || reply.info.error) {
-        return
-      }
-      if (hasMeaningfulOutput(reply.parts)) {
+    if (replies.length > 0) {
+      if (replies.some((item) => item.info.finish || item.info.error || hasMeaningfulOutput(item.parts))) {
         return
       }
     } else {

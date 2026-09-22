@@ -99,6 +99,10 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
   return part.state.status === "error" && part.state.metadata?.interrupted === true
 }
 
+function hasMeaningfulOutput(parts: readonly SessionV1.Part[]) {
+  return parts.some((part) => (part.type === "text" && part.text.trim().length > 0) || part.type === "tool")
+}
+
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
@@ -1214,12 +1218,23 @@ const layer = Layer.effect(
             // - 纯 thinking（只有 reasoning/step-start）→ 不设 finish 也不设
             //   error，toModelMessagesEffect 会将其过滤出模型上下文；CLI 侧
             //   auto-restore 会删除该半截消息与上一条 user 消息并恢复输入。
+            // 注意：多步回合里被中断的这一步可能只剩 reasoning，但同一 user 回合
+            // 下更早的步骤已有 text/tool（甚至已 finish）。整轮有输出时同样
+            // finish="stop"，否则客户端会把已有结果当纯 thinking 半截删除回填。
             const found = yield* sessions.findMessage(sessionID, (m) => m.info.id === msg.id).pipe(Effect.orDie)
             const parts = Option.isSome(found) ? found.value.parts : []
-            const hasOutput = parts.some(
-              (p) => (p.type === "text" && p.text.trim().length > 0) || p.type === "tool",
-            )
-            if (hasOutput) {
+            const turnOutput =
+              hasMeaningfulOutput(parts) ||
+              (yield* sessions.messages({ sessionID, limit: 50 }).pipe(Effect.orDie)).some(
+                (message) =>
+                  message.info.role === "assistant" &&
+                  message.info.id !== msg.id &&
+                  message.info.parentID === msg.parentID &&
+                  (message.info.finish !== undefined ||
+                    message.info.error !== undefined ||
+                    hasMeaningfulOutput(message.parts)),
+              )
+            if (turnOutput) {
               msg.finish ??= "stop"
             }
             msg.time.completed = Date.now()

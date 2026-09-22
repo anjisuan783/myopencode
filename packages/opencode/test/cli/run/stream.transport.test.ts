@@ -2512,6 +2512,130 @@ describe("run stream transport", () => {
     }
   })
 
+  test("does not auto-restore an interrupted turn whose text part already completed", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const deleted: string[] = []
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        stream: src.stream,
+        promptAsync: async () => {
+          queueMicrotask(() => {
+            src.push(busy())
+            src.push(user("msg-user-1"))
+            src.push(assistant("msg-a1"))
+            src.push(textUpdated({ ...textPart("text-1", "msg-a1", "partial answer"), time: { start: 1, end: 2 } }))
+          })
+          return ok(undefined)
+        },
+        deleteMessage: async ({ messageID }) => {
+          deleted.push(messageID)
+          return ok(true)
+        },
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+
+    const ctrl = new AbortController()
+
+    try {
+      const run = transport.runPromptTurn({
+        agent: undefined,
+        model: undefined,
+        variant: undefined,
+        prompt: { text: "fix the bug", parts: [] },
+        files: [],
+        includeFiles: false,
+        signal: ctrl.signal,
+      })
+
+      await waitFor(() =>
+        ui.commits.some((commit) => commit.kind === "assistant" && commit.messageID === "msg-a1") ? true : undefined,
+      )
+
+      ctrl.abort()
+      await run
+
+      expect(ui.drafts).toEqual([])
+      expect(deleted).toEqual([])
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("does not auto-restore a multi-step turn whose earlier step produced output", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const deleted: string[] = []
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        stream: src.stream,
+        promptAsync: async () => {
+          queueMicrotask(() => {
+            src.push(busy())
+            src.push(user("msg-user-1"))
+            src.push(assistant("msg-a1"))
+            src.push(
+              toolUpdated(
+                completedTool({
+                  sessionID: "session-1",
+                  messageID: "msg-a1",
+                  id: "tool-1",
+                  callID: "call-1",
+                  tool: "read",
+                  body: { filePath: "/tmp/x" },
+                  output: "content",
+                }),
+              ),
+            )
+            src.push(assistant("msg-a2"))
+            src.push(reasoningUpdated(reasoningPart("reason-2", "msg-a2", "thinking")))
+          })
+          return ok(undefined)
+        },
+        deleteMessage: async ({ messageID }) => {
+          deleted.push(messageID)
+          return ok(true)
+        },
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+
+    const ctrl = new AbortController()
+
+    try {
+      const run = transport.runPromptTurn({
+        agent: undefined,
+        model: undefined,
+        variant: undefined,
+        prompt: { text: "fix the bug", parts: [] },
+        files: [],
+        includeFiles: false,
+        signal: ctrl.signal,
+      })
+
+      await waitFor(() =>
+        ui.commits.some((commit) => commit.kind === "reasoning" && commit.messageID === "msg-a2") ? true : undefined,
+      )
+
+      ctrl.abort()
+      await run
+
+      expect(ui.drafts).toEqual([])
+      expect(deleted).toEqual([])
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
   test("does not auto-restore an interrupted turn with a running tool", async () => {
     const src = eventFeed()
     const ui = footer()

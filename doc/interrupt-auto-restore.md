@@ -157,7 +157,7 @@ transport 收到 `session.status idle` → `mark` → `complete` → `waitTurn` 
 | 1 | `state.interruptedTurn` | :891 | 本回合最后一条 assistant 消息"无 finish 无 error"（脆弱） |
 | 2 | footer 未关闭 | :898 | transport/footer 正常 |
 | 3 | `draftText()` 为空 | :906 | 用户没在输入新内容，避免覆盖 |
-| 4 | `hasMeaningfulOutput` 为假 | :916 | 无非空 assistant 文本、无进行中工具（纯 thinking 才过） |
+| 4 | `state.sawOutput` 与 `hasMeaningfulOutput` 均为假 | :916 | 本回合从未产生非空 assistant 文本/工具调用（纯 thinking 才过；`sawOutput` 覆盖已结束并被 `drop` 的输出） |
 | 5 | `lastUserTurn` 取到 user | :923 | `data.role` 里能找到 user 消息 |
 
 全部通过后（非阻塞 fire-and-forget）：
@@ -180,9 +180,10 @@ finalizeInterruptedAssistant）跑完，所以 abort resolve 时"有输出/纯 t
 2. `await abort` → `session.messages({ sessionID, limit: 100 })` 拉权威状态。
 3. **归属校验**：fetch 里必须能找到 anchor 这条 user；找不到则不猜测、不处理
    （防止历史上遗留的旧 thinking 半截被误判成本轮）。
-4. 取 anchor 的 assistant replies（`parentID === anchor`）最后一条：
-   - 有 `finish || error` → 视为正常完成/有输出，不处理；
-   - 无 finish/error 但 parts 有非空 text 或 tool → 兜底拦截，不处理；
+4. 逐条检查 anchor 的 assistant replies（`parentID === anchor`）：
+   - 任意一条有 `finish || error`，或 parts 有非空 text/tool → 整轮已有实质输出，
+     不处理（多步回合里最后一步可能只剩 reasoning，但更早步骤已有输出）；
+   - 全部 reply 都没有输出 → 纯 thinking 半截，继续删除；
    - 无 reply（S5，服务端还没建半截就被打断）→ 继续，但要求 anchor 是 fetch
      里最后一条 user 消息。
 5. 从 anchor 的 parts 重建 PromptInfo（非 synthetic text 拼 input + file part 去 ID）。
@@ -217,6 +218,7 @@ finalizeInterruptedAssistant）跑完，所以 abort resolve 时"有输出/纯 t
 | S1 | **纯 thinking 被中断**（无文本无工具） | 无 finish 无 error（time.completed） | ✅ 删除 | ✅ 回填 | 半截被过滤，不回显 |
 | S2 | **有部分文本被中断** | finalize 置 `finish="stop"` | ❌ 保留 | ❌ 不回填 | 正常显示（按完成回合） |
 | S3 | **有工具调用被中断** | 工具标 `interrupted:true`；因 hasOutput 置 `finish="stop"` | ❌ 保留 | ❌ 不回填 | interrupted 工具部分被过滤，文本保留 |
+| S3b | **多步回合的后一步纯 thinking 被中断**（前一步已有 text/tool） | 半截本身无输出，但服务端按整轮有输出置 `finish="stop"` | ❌ 保留 | ❌ 不回填 | 半截按完成保留，前序步骤正常 |
 | S4 | **正常完成** | finish=stop/tool-calls… | ❌ | ❌ | 正常 |
 | S5 | **中断早于 assistant 创建** | 无半截 | run：❌（整段不进入）；TUI：✅ 删 user | run：❌；TUI：✅ 回填 | 无半截 |
 | S6 | **中断时用户正在输入新内容** | 同 S1 | ✅ 删除（关卡 3 只挡回填不挡删除） | ❌ `draftText()` 非空 → 跳过回填 | 半截被过滤 |
@@ -230,6 +232,10 @@ finalizeInterruptedAssistant）跑完，所以 abort resolve 时"有输出/纯 t
 - S6：`draftText()` 守卫(:906) 只挡"回填"，不挡"删除"——删除照常进行，符合
   "不打扰用户正在输入的内容，但仍把旧请求从上下文拿掉"的意图。普通 TUI 同语义。
 - S2/S3 语义：有实质输出 = "保留结果"而非"放弃重来"，所以不回填、不删除。
+- 多步回合（S3b）：输出判定按整轮而非最后一条 reply。服务端 finalize 额外检查同一
+  `parentID` 下更早的 assistant 消息（prompt.ts）；TUI 逐条回复检查；run 模式用
+  `state.sawOutput` 记录本回合出现过的非空文本/工具调用（part 结束后被 `drop`
+  也仍保留该标记，且不受 idle/finalize 事件顺序影响）。
 - 删除可见性：run 模式的滚动区是 immutable 的，删除只在 DB/上下文；普通 TUI 的
   时间线由 sync store 驱动，`message.removed` 会让该轮直接从界面消失（预期）。
 
@@ -246,14 +252,18 @@ finalizeInterruptedAssistant）跑完，所以 abort resolve 时"有输出/纯 t
      输入框回填；有正文的中断不处理。
    - 注意：普通 TUI 无 trace；判定数据来自 `session.messages`，可用 DB/接口直接核对。
 
-2. **run 模式 `state.interruptedTurn` 仍是竞态**（stream.transport.ts:986-999）
+2. **run 模式 `state.interruptedTurn` 竞态（输出回合已缓解，2026-09-21）**
    - 每条 `message.updated` 都覆盖赋值；只有"最后一条恰好是 assistant 无 finish
      无 error"才为 true，与 idle/finalize 事件到达顺序耦合（§2.5：idle 通常先到）。
-   - 测试用本地 `ctrl.abort()` + 固定事件序，覆盖不到真实 idle 时序。静态推演纯
-     thinking 场景最终仍为 true，但没有真实 trace 坐实，暂未改动。
-   - 若要修：改为回合级最终判定——只跟踪 assistant 的 `{finish,error}`，回合结束
-     （idle/abort 两处）再判定，user 消息不参与；或像普通 TUI 一样 abort 后从
-     服务端拉状态判定。
+   - 现在 gate 4 同时看回合级 `state.sawOutput`（applyEvent 从 commits 记录非空
+     assistant 文本/工具，runPromptTurn 开始时重置）：只要本回合出现过输出，即使
+     还没看到 finalize 的 `finish="stop"` 也不会删除回填。单靠 `hasMeaningfulOutput`
+     不可靠——文本/工具 part 结束后会被 `drop`（session-data.ts），旧输出从此看不
+     见；测试里的 text part 没有 `time.end`，所以覆盖不到这个场景。
+   - 纯 thinking 回合 `sawOutput` 为 false，仍按 S1 删除回填。
+   - 若要彻底修 gate 1：改为回合级最终判定——只跟踪 assistant 的 `{finish,error}`，
+     回合结束（idle/abort 两处）再判定，user 消息不参与；或像普通 TUI 一样 abort
+     后从服务端拉状态判定。
 
 3. **run 模式 `lastUserTurn` 依赖 `data.role`，但 `bootstrapSessionData` 不填 role**
    - session-data.ts:283 只填 `data.call`/permissions/questions。
@@ -308,14 +318,17 @@ finalizeInterruptedAssistant）跑完，所以 abort resolve 时"有输出/纯 t
 - `test/cli/run/stream.transport.test.ts`：
   - auto-restores an interrupted pure-thinking turn into the input box and deletes it from context
   - does not auto-restore an interrupted turn that produced text
+  - does not auto-restore an interrupted turn whose text part already completed（`time.end` 后 part 被 drop）
+  - does not auto-restore a multi-step turn whose earlier step produced output
   - does not auto-restore an interrupted turn with a running tool
   - does not auto-restore over a non-empty draft
 - `test/session/message-v2.test.ts`：半截过滤 / interrupted 工具过滤 / 未 finalize 半截保留。
 - `test/session/prompt.test.ts`、`test/session/processor-effect.test.ts`：中断不设 AbortedError、
-  状态回 idle。
+  状态回 idle；多步回合后一步被中断且整轮有输出时置 `finish="stop"`。
 - 普通 TUI `packages/tui/test/routes/session/auto-restore.test.ts`：
   - 纯 thinking → 删除 replies+user 并回填
-  - 有 text / 有 tool / 有 finish / 有 error → 不动
+  - 整轮无输出的多步回合（全部 reply 只有 reasoning）→ 删除 replies+user 并回填
+  - 有 text / 有 tool / 有 finish / 有 error / 前序 reply 有输出 → 不动
   - S5 无 reply → 删 user 并回填
   - anchor 找不到 / anchor 非最后一条 user → 不猜测、不动
   - 输入框非空 / 已切 session → 删除但跳过回填

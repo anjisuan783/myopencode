@@ -121,11 +121,24 @@ describe("auto-restore interrupted turn", () => {
     expect(h.prompts).toEqual([{ input: "fix the bug", parts: [] }])
   })
 
-  test("deletes every reply of a multi-step turn", async () => {
+  test("keeps a multi-step turn when an earlier reply produced output", async () => {
     const h = await run({
       messages: [
         user("msg-user"),
         assistant("msg-a1", "msg-user", { finish: "tool-calls", parts: [{ type: "tool" }] }),
+        assistant("msg-a2", "msg-user"),
+      ],
+    })
+
+    expect(h.deleted).toEqual([])
+    expect(h.prompts).toEqual([])
+  })
+
+  test("deletes every reply of a multi-step turn when no reply produced output", async () => {
+    const h = await run({
+      messages: [
+        user("msg-user"),
+        assistant("msg-a1", "msg-user", { parts: [{ type: "reasoning", text: "thinking" }] }),
         assistant("msg-a2", "msg-user"),
       ],
     })
